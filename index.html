@@ -194,10 +194,10 @@
         <p class="hero-note">Free to use. No app download required to view alerts.</p>
       </div>
 
-      <div class="gauge-card" role="img" aria-label="Sample flood level gauge showing safe, moderate, and high-risk bands">
+      <div class="gauge-card" role="img" aria-label="Live flood level gauge showing the most urgent current report">
         <div class="gauge-head">
-          <span class="place">Barangay San Isidro</span>
-          <span class="time">Updated 4 min ago</span>
+          <span class="place" id="heroPlace">Barangay San Isidro</span>
+          <span class="time" id="heroTime">Updated 4 min ago</span>
         </div>
         <div class="gauge-bands">
           <div class="band-row band-safe"><span>Green — Safe</span><span class="tag">Passable</span></div>
@@ -205,7 +205,7 @@
           <div class="band-row band-danger"><span>Red — High-risk</span><span class="tag">Avoid area</span></div>
         </div>
         <div class="water-level" aria-hidden="true"><span id="waterFill"></span></div>
-        <p class="gauge-fill-note">Water level rising near Purok 3 — checked against PAGASA data</p>
+        <p class="gauge-fill-note" id="heroNote">Water level rising near Purok 3 — checked against PAGASA data</p>
       </div>
     </div>
   </section>
@@ -346,34 +346,48 @@
 <div id="toast"></div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
-<script type="module">
-  // ---------- Firebase setup ----------
-  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
-  import {
-    getFirestore, collection, addDoc, onSnapshot, serverTimestamp
-  } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
-
-  const firebaseConfig = {
-    apiKey: "AIzaSyDp297ORjxWT4r1Qtv59CTM6fwZ7uQ_kLE",
-    authDomain: "tawidprototype.firebaseapp.com",
-    projectId: "tawidprototype",
-    storageBucket: "tawidprototype.firebasestorage.app",
-    messagingSenderId: "749424892451",
-    appId: "1:749424892451:web:e67f1c8e5a1328d789af96"
-  };
-
-  const firebaseApp = initializeApp(firebaseConfig);
-  const db = getFirestore(firebaseApp);
-  const reportsCollection = collection(db, "reports");
-
-  // Live reports coming from Firestore, kept in sync automatically.
+<script>
+  // ---------- Firebase setup (loaded dynamically so a failure here can't break site navigation) ----------
+  var reportsCollection = null;
   var liveReports = [];
-  onSnapshot(reportsCollection, function(snapshot){
-    liveReports = snapshot.docs.map(function(doc){ return doc.data(); });
-    renderMarkers();
-  }, function(err){
-    console.error("Firestore listen failed:", err);
-  });
+
+  function initFirebase(){
+    var firebaseConfig = {
+      apiKey: "AIzaSyDp297ORjxWT4r1Qtv59CTM6fwZ7uQ_kLE",
+      authDomain: "tawidprototype.firebaseapp.com",
+      projectId: "tawidprototype",
+      storageBucket: "tawidprototype.firebasestorage.app",
+      messagingSenderId: "749424892451",
+      appId: "1:749424892451:web:e67f1c8e5a1328d789af96"
+    };
+
+    Promise.all([
+      import("https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js"),
+      import("https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js")
+    ]).then(function(mods){
+      var initializeApp = mods[0].initializeApp;
+      var getFirestore = mods[1].getFirestore;
+      var collection = mods[1].collection;
+      var onSnapshot = mods[1].onSnapshot;
+
+      var firebaseApp = initializeApp(firebaseConfig);
+      var db = getFirestore(firebaseApp);
+      reportsCollection = collection(db, "reports");
+      window.__firestoreAddDoc = mods[1].addDoc;
+      window.__firestoreServerTimestamp = mods[1].serverTimestamp;
+
+      onSnapshot(reportsCollection, function(snapshot){
+        liveReports = snapshot.docs.map(function(doc){ return doc.data(); });
+        renderMarkers();
+        updateHeroCard();
+      }, function(err){
+        console.error("Firestore listen failed:", err);
+      });
+    }).catch(function(err){
+      console.error("Firebase failed to load — live reports are disabled, but the rest of the site still works.", err);
+    });
+  }
+  initFirebase();
 
   // ---------- Sample seed reports (old + recent, for demo) ----------
   var SEED_REPORTS = [
@@ -392,6 +406,49 @@
     if(hoursAgo < 24) return Math.round(hoursAgo) + ' hour' + (Math.round(hoursAgo)===1?'':'s') + ' ago';
     var days = Math.round(hoursAgo/24);
     return days + ' day' + (days===1?'':'s') + ' ago';
+  }
+
+  // ---------- Geocoding (turns typed location text into real coordinates) ----------
+  // Uses OpenStreetMap's free Nominatim service. Falls back to Metro Manila center if not found.
+  function geocodeLocation(text){
+    var query = encodeURIComponent(text + ', Philippines');
+    var url = 'https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + query;
+    return fetch(url, { headers: { 'Accept': 'application/json' } })
+      .then(function(res){ return res.json(); })
+      .then(function(results){
+        if(results && results.length > 0){
+          return { lat: parseFloat(results[0].lat), lng: parseFloat(results[0].lon), matched: true };
+        }
+        return { lat: 14.615, lng: 121.06, matched: false };
+      })
+      .catch(function(){
+        return { lat: 14.615, lng: 121.06, matched: false };
+      });
+  }
+
+  // ---------- Hero card: reflects the most urgent current report ----------
+  var LEVEL_RANK = {danger:2, watch:1, safe:0};
+  var LEVEL_FILL = {danger:'92%', watch:'58%', safe:'18%'};
+  function updateHeroCard(){
+    var placeEl = document.getElementById('heroPlace');
+    var timeEl = document.getElementById('heroTime');
+    var noteEl = document.getElementById('heroNote');
+    var fillEl = document.getElementById('waterFill');
+    if(!placeEl) return;
+
+    var all = SEED_REPORTS.concat(liveReports);
+    if(all.length === 0) return;
+
+    var top = all.reduce(function(best, r){
+      if(!best) return r;
+      if(LEVEL_RANK[r.level] !== LEVEL_RANK[best.level]) return LEVEL_RANK[r.level] > LEVEL_RANK[best.level] ? r : best;
+      return (r.hoursAgo < best.hoursAgo) ? r : best;
+    }, null);
+
+    placeEl.textContent = top.loc;
+    timeEl.textContent = 'Updated ' + timeAgoLabel(top.hoursAgo);
+    noteEl.textContent = top.desc;
+    if(fillEl) fillEl.style.width = LEVEL_FILL[top.level];
   }
 
   var map, markerLayer;
@@ -501,24 +558,26 @@
     var desc = document.getElementById('desc').value.trim();
     if(!loc || !desc) return;
 
-    // Demo geocoding: nudge a random point near Metro Manila center so the pin appears somewhere sensible.
-    var lat = 14.615 + (Math.random() - 0.5) * 0.12;
-    var lng = 121.06 + (Math.random() - 0.5) * 0.12;
-
     var submitBtn = document.querySelector('#reportForm button[type="submit"]');
     submitBtn.disabled = true;
-    submitBtn.textContent = 'Submitting…';
+    submitBtn.textContent = 'Locating…';
 
-    addDoc(reportsCollection, {
-      loc: loc,
-      lat: lat,
-      lng: lng,
-      level: selectedSeverity,
-      desc: desc,
-      hoursAgo: 0,
-      userSubmitted: true,
-      createdAt: serverTimestamp()
-    }).then(function(){
+    geocodeLocation(loc).then(function(coords){
+      if(!reportsCollection || !window.__firestoreAddDoc){
+        throw new Error('Firebase is not ready yet — please wait a moment and try again.');
+      }
+      submitBtn.textContent = 'Submitting…';
+      return window.__firestoreAddDoc(reportsCollection, {
+        loc: loc,
+        lat: coords.lat,
+        lng: coords.lng,
+        level: selectedSeverity,
+        desc: desc,
+        hoursAgo: 0,
+        userSubmitted: true,
+        createdAt: window.__firestoreServerTimestamp ? window.__firestoreServerTimestamp() : null
+      }).then(function(){ return coords; });
+    }).then(function(coords){
       document.getElementById('reportForm').reset();
       fileDrop.textContent = 'Tap to attach a photo — preview only in this demo';
       fileDrop.classList.remove('has-file');
@@ -527,7 +586,11 @@
       selectedSeverity = 'watch';
 
       handleNav('map');
-      showToast('Report submitted — now visible to everyone on the live map.');
+      if(coords.matched){
+        showToast('Report submitted — now visible to everyone on the live map.');
+      } else {
+        showToast('Report submitted, but the location couldn\'t be pinpointed exactly — placed near Metro Manila center.');
+      }
     }).catch(function(err){
       console.error('Failed to submit report:', err);
       showToast('Something went wrong submitting your report. Please try again.');
@@ -539,13 +602,7 @@
 
   // ---------- Hero water animation ----------
   window.addEventListener('DOMContentLoaded', function(){
-    var fill = document.getElementById('waterFill');
-    var prefersReduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    var target = '62%';
-    if(fill){
-      if(prefersReduced){ fill.style.width = target; }
-      else{ setTimeout(function(){ fill.style.width = target; }, 250); }
-    }
+    updateHeroCard();
     handleNav(window.location.hash.replace('#','') || 'home');
   });
 </script>
